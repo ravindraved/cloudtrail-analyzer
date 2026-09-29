@@ -1,0 +1,727 @@
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useTranslation } from 'react-i18next'
+import { CloudDownload, Loader2, Play, AlertCircle, RefreshCw, Database, Square, RotateCw, Zap, Clock, HardDrive, Trash2 } from 'lucide-react'
+import { useSettings } from '../settings/hooks'
+import { useIndexStatus, useIndexProgress, useDeleteSession } from './hooks'
+import { endpoints } from '../../config/api'
+import { readApiError } from '../../comm/apiError'
+import { AccountLabel } from '../../comm/AccountLabel'
+import type { Session, ProgressSnapshot } from '../../types/session'
+
+const SESSION_STATES = new Set([
+  'pending',
+  'downloading',
+  'extracting',
+  'verifying',
+  'query-ready',
+  'partially-verified',
+  'failed',
+  'interrupted',
+  'deleted',
+])
+
+function isSession(value: unknown): value is Session {
+  if (!value || typeof value !== 'object') return false
+  const session = value as Record<string, unknown>
+  return (
+    typeof session.id === 'string' &&
+    typeof session.bucket === 'string' &&
+    typeof session.account_id === 'string' &&
+    typeof session.region === 'string' &&
+    typeof session.log_region === 'string' &&
+    typeof session.mode === 'string' &&
+    typeof session.start_date === 'string' &&
+    typeof session.end_date === 'string' &&
+    typeof session.state === 'string' &&
+    SESSION_STATES.has(session.state) &&
+    typeof session.total_files === 'number' &&
+    typeof session.disk_usage_bytes === 'number' &&
+    typeof session.created_at === 'string' &&
+    typeof session.updated_at === 'string'
+  )
+}
+
+export function S3SyncView() {
+  const { t } = useTranslation()
+  const { data: settings, loading: settingsLoading, error: settingsError, refetch: refetchSettings } = useSettings()
+
+  const [startDate, setStartDate] = useState('')
+  const [endDate, setEndDate] = useState('')
+  const [sessions, setSessions] = useState<Session[]>([])
+  const [sessionsLoading, setSessionsLoading] = useState(true)
+  const [sessionsError, setSessionsError] = useState<string | null>(null)
+  const [syncing, setSyncing] = useState(false)
+  const [syncError, setSyncError] = useState<string | null>(null)
+  const [liveProgress, setLiveProgress] = useState<Record<string, ProgressSnapshot>>({})
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const sessionsRequestRef = useRef(0)
+
+  const s3Settings = settings?.s3
+  const bucket = s3Settings?.bucket
+  const mode = s3Settings?.mode
+  const orgId = s3Settings?.org_id
+  const accountId = s3Settings?.account_id
+  const memberAccounts = s3Settings?.member_accounts ?? []
+  const logRegion = s3Settings ? (s3Settings.log_region || s3Settings.region || 'us-east-1') : ''
+
+  // Determine which accounts to sync
+  const accountsToSync = !s3Settings
+    ? []
+    : mode === 'control_tower'
+      ? memberAccounts
+      : accountId
+        ? [accountId]
+        : []
+
+  const fetchSessions = useCallback(async () => {
+    const requestId = ++sessionsRequestRef.current
+    try {
+      setSessionsError(null)
+      const res = await fetch('/api/sessions')
+      if (!res.ok) {
+        throw new Error(await readApiError(res, 'Failed to load sessions'))
+      }
+      const data: unknown = await res.json()
+      if (!Array.isArray(data) || !data.every(isSession)) {
+        throw new Error('Sessions returned an invalid response')
+      }
+      if (requestId === sessionsRequestRef.current) {
+        setSessions(data.slice(0, 30))
+      }
+    } catch (e: unknown) {
+      if (requestId === sessionsRequestRef.current) {
+        setSessions([])
+        setLiveProgress({})
+        setSessionsError(e instanceof Error && e.message ? e.message : 'Failed to load sessions')
+      }
+    } finally {
+      if (requestId === sessionsRequestRef.current) setSessionsLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (settings) void fetchSessions()
+  }, [settings, fetchSessions])
+
+  // Poll progress snapshots for active sessions every 2 seconds
+  useEffect(() => {
+    const activeSessions = sessions.filter(s =>
+      s.state === 'downloading' || s.state === 'extracting' || s.state === 'verifying'
+    )
+    if (activeSessions.length === 0) {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+      return
+    }
+
+    const pollProgress = async () => {
+      const updates: Record<string, ProgressSnapshot> = {}
+      await Promise.all(activeSessions.map(async (session) => {
+        try {
+          const res = await fetch(endpoints.sessionProgressSnapshot(session.id))
+          if (res.ok) {
+            const snap = await res.json()
+            if (snap.phase && snap.phase !== 'idle') {
+              updates[session.id] = snap
+            }
+          }
+        } catch { /* silent */ }
+      }))
+      if (Object.keys(updates).length > 0) {
+        setLiveProgress(prev => ({ ...prev, ...updates }))
+      }
+    }
+
+    pollProgress()
+    pollRef.current = setInterval(() => { pollProgress(); fetchSessions() }, 2000)
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+  }, [sessions, fetchSessions])
+
+  // Start sync for all selected accounts
+  const handleStartSync = async () => {
+    if (!settings || !bucket || !startDate || !endDate || accountsToSync.length === 0) return
+    setSyncing(true)
+    setSyncError(null)
+    let confirmedStarted = 0
+    let startRequestAttempted = false
+
+    try {
+      for (const acct of accountsToSync) {
+        // Create session — bucket, region, and mode come from saved S3 config on the backend
+        const createRes = await fetch(endpoints.sessions, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            account_id: acct, org_id: orgId || undefined,
+            log_region: logRegion,
+            start_date: startDate, end_date: endDate,
+          }),
+        })
+        if (!createRes.ok) {
+          const message = await readApiError(createRes, 'Failed to create session')
+          throw new Error(`Account ${acct}: ${message}`)
+        }
+        const session: Session = await createRes.json()
+
+        // Start processing
+        startRequestAttempted = true
+        const startRes = await fetch(endpoints.sessionProcess(session.id), { method: 'POST' })
+        if (!startRes.ok) {
+          const message = await readApiError(startRes, 'Failed to start sync')
+          throw new Error(`Account ${acct}: ${message}`)
+        }
+        confirmedStarted += 1
+      }
+    } catch (e) {
+      const message = (e as Error).message
+      if (confirmedStarted > 0 || startRequestAttempted) {
+        const startStatus = confirmedStarted > 0
+          ? `${confirmedStarted} account sync(s) were confirmed started.`
+          : 'A start request was sent, but no successful response was received.'
+        setSyncError(
+          `${message} ${startStatus} Some accounts may already be running. Review the refreshed session list before retrying.`,
+        )
+      } else {
+        setSyncError(message)
+      }
+    } finally {
+      await fetchSessions()
+      setSyncing(false)
+    }
+  }
+
+  const canSubmit = Boolean(bucket && accountsToSync.length > 0 && startDate && endDate && !syncing)
+
+  if (settingsLoading) {
+    return <div className="flex items-center justify-center h-full"><Loader2 className="w-5 h-5 animate-spin text-gray-400" /></div>
+  }
+
+  if (settingsError || !settings) {
+    return (
+      <div className="flex items-center justify-center h-full p-6">
+        <div role="alert" className="max-w-md w-full p-5 rounded-lg border border-red-200 dark:border-red-900/30 bg-red-50 dark:bg-red-900/10 text-center">
+          <AlertCircle className="w-7 h-7 text-red-500 mx-auto mb-2" />
+          <h2 className="text-sm font-semibold text-red-800 dark:text-red-200">Unable to load settings</h2>
+          <p className="mt-1 text-xs text-red-700 dark:text-red-300">{settingsError || 'The settings response was empty.'}</p>
+          <button type="button" onClick={() => void refetchSettings()}
+            className="mt-4 inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-md border border-red-300 dark:border-red-700 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/20">
+            <RefreshCw className="w-3.5 h-3.5" /> {t('common.retry')}
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  if (!bucket) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="text-center p-8 rounded-lg border border-dashed border-gray-300 dark:border-gray-600">
+          <AlertCircle className="w-8 h-8 text-amber-500 mx-auto mb-3" />
+          <h2 className="text-base font-semibold text-gray-900 dark:text-white mb-2">{t('data.sync.configIncomplete')}</h2>
+          <p className="text-sm text-gray-500 dark:text-gray-400">{t('data.sync.goToSettings')}</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="h-full flex flex-col">
+      {/* Header */}
+      <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
+        <div className="flex items-center gap-3">
+          <CloudDownload className="w-5 h-5 text-[#0972d3]" />
+          <div>
+            <h2 className="text-base font-semibold text-gray-900 dark:text-white">{t('data.sync.title')}</h2>
+            <p className="text-[11px] text-gray-600 dark:text-gray-400">
+              {t('data.sync.accountsSelected', { count: accountsToSync.length })}
+              &nbsp;• {t('data.sync.regionLabel', { region: logRegion })} • {mode === 'control_tower' ? t('data.sync.modeControlTower') : t('data.sync.modeSingleAccount')}
+            </p>
+          </div>
+        </div>
+        <button type="button" onClick={fetchSessions} aria-label={t('common.refresh')} className="inline-flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800">
+          <RefreshCw className="w-3 h-3" /> {t('common.refresh')}
+        </button>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-6">
+        <div className="max-w-3xl space-y-6">
+
+          {/* New Sync Form */}
+          <div className="p-4 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 space-y-4">
+            <h3 className="text-sm font-medium text-gray-900 dark:text-white">{t('data.sync.newSync')}</h3>
+
+            {/* Accounts summary */}
+            <div className="p-3 rounded bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700">
+              <p className="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1.5">{t('data.sync.accountsToDownload')}</p>
+              <div className="flex flex-wrap gap-1.5">
+                {accountsToSync.map(acct => (
+                  <span key={acct} className="inline-block px-2 py-0.5 text-[11px] font-mono bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded">
+                    {acct}
+                  </span>
+                ))}
+              </div>
+              {accountsToSync.length === 0 && (
+                <p className="text-xs text-amber-600">{t('data.sync.noAccountsSelected')}</p>
+              )}
+            </div>
+
+            {/* Date range */}
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="startDate" className="block text-xs text-gray-700 dark:text-gray-300 mb-1">{t('data.sync.startDate')}</label>
+                <input id="startDate" type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="w-full px-3 py-2 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+              </div>
+              <div>
+                <label htmlFor="endDate" className="block text-xs text-gray-700 dark:text-gray-300 mb-1">{t('data.sync.endDate')}</label>
+                <input id="endDate" type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="w-full px-3 py-2 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+              </div>
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400 -mt-1">
+              <Clock className="inline w-3 h-3 mr-1 -mt-px" />
+              Dates select CloudTrail S3 delivery partitions, not exact event timestamps. Include the adjacent UTC day when boundary completeness matters.
+            </p>
+
+            <button type="button" onClick={handleStartSync} disabled={!canSubmit}
+              className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-[#0972d3] text-white hover:bg-[#0860b0] disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+              {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+              {syncing ? t('data.sync.syncing', { count: accountsToSync.length }) : t('data.sync.startSync', { count: accountsToSync.length })}
+            </button>
+            {syncError && <p role="alert" className="text-sm text-red-600 dark:text-red-400">{syncError}</p>}
+          </div>
+
+          {/* Active Downloads */}
+          {sessions.filter(s => s.state === 'downloading' || s.state === 'extracting' || s.state === 'verifying').length > 0 && (
+            <div>
+              <h3 className="text-sm font-medium text-gray-900 dark:text-white mb-3">{t('data.sync.activeDownloads')}</h3>
+              <div className="space-y-3">
+                {sessions.filter(s => s.state === 'downloading' || s.state === 'extracting' || s.state === 'verifying').map(session => (
+                  <ActiveSessionCard key={session.id} session={session} snapshot={liveProgress[session.id]} />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Index Progress */}
+          <IndexProgressCard />
+
+          {/* Completed Syncs */}
+          <div>
+            <h3 className="text-sm font-medium text-gray-900 dark:text-white mb-3">{t('data.sync.syncHistory')}</h3>
+            {sessionsLoading && <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300"><Loader2 className="w-3 h-3 animate-spin" /> {t('common.loading')}</div>}
+
+            {sessionsError && (
+              <div className="p-3 rounded-md border border-red-200 dark:border-red-900/30 bg-red-50 dark:bg-red-900/10 mb-3">
+                <p className="text-xs text-red-700 dark:text-red-300">{sessionsError}</p>
+              </div>
+            )}
+
+            {!sessionsLoading && !sessionsError && sessions.filter(s => s.state !== 'downloading' && s.state !== 'extracting' && s.state !== 'verifying').length === 0 && (
+              <p className="text-sm text-gray-700 dark:text-gray-300">{t('data.sync.noCompleted')}</p>
+            )}
+
+            {sessions.filter(s => s.state !== 'downloading' && s.state !== 'extracting' && s.state !== 'verifying').length > 0 && (
+              <div className="border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
+                      <th className="text-left px-3 py-2 font-medium text-gray-700 dark:text-gray-300">{t('data.sync.account')}</th>
+                      <th className="text-left px-3 py-2 font-medium text-gray-700 dark:text-gray-300">{t('data.sync.dateRange')}</th>
+                      <th className="text-left px-3 py-2 font-medium text-gray-700 dark:text-gray-300">{t('data.sync.files')}</th>
+                      <th className="text-left px-3 py-2 font-medium text-gray-700 dark:text-gray-300">{t('data.sync.sizeOnDisk')}</th>
+                      <th className="text-left px-3 py-2 font-medium text-gray-700 dark:text-gray-300">{t('data.sync.lastUpdated')}</th>
+                      <th className="text-left px-3 py-2 font-medium text-gray-700 dark:text-gray-300">{t('data.sync.status')}</th>
+                      <th className="px-3 py-2"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sessions.filter(s => s.state !== 'downloading' && s.state !== 'extracting' && s.state !== 'verifying').map(session => (
+                      <CompletedSessionRow key={session.id} session={session} onDeleted={fetchSessions} />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const i = Math.floor(Math.log(bytes) / Math.log(1024))
+  return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`
+}
+
+function formatRelativeTime(iso: string): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  const t = d.getTime()
+  // Reject invalid dates and Go's zero time (0001-01-01T00:00:00Z)
+  if (Number.isNaN(t) || d.getUTCFullYear() < 1971) return '—'
+  const secs = Math.max(0, Math.floor((Date.now() - t) / 1000))
+  if (secs < 60) return `${secs}s ago`
+  const mins = Math.floor(secs / 60)
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs}h ago`
+  const days = Math.floor(hrs / 24)
+  if (days < 30) return `${days}d ago`
+  return d.toLocaleDateString()
+}
+
+function IndexProgressCard() {
+  const { t } = useTranslation()
+  const { status, refresh } = useIndexStatus()
+  const { data: progress, done, active, connect, disconnect } = useIndexProgress()
+  // Tracks whether we've already opened a stream for the current build episode.
+  // Without this guard the effect would re-`connect()` every time the hook flips
+  // `active` to false (e.g. between backoff retries), defeating the backoff.
+  const streamingRef = useRef(false)
+
+  const handleBuild = async () => {
+    await fetch(endpoints.indexBuild, { method: 'POST' })
+    streamingRef.current = true
+    connect()
+    refresh()
+  }
+
+  const handleCancel = async () => {
+    await fetch(endpoints.indexCancel, { method: 'POST' })
+    refresh()
+  }
+
+  useEffect(() => {
+    if (done) refresh()
+  }, [done, refresh])
+
+  // Open the live stream once per build episode and tear it down when the build
+  // leaves the "building" state. The hook owns reconnect-with-backoff while the
+  // build is in progress, so we must not re-connect on every `active` flip.
+  useEffect(() => {
+    const building = status?.index_status === 'building'
+    if (building && !streamingRef.current) {
+      streamingRef.current = true
+      connect()
+    } else if (!building && streamingRef.current) {
+      streamingRef.current = false
+      disconnect()
+    }
+  }, [status, connect, disconnect])
+
+  const pct = progress?.percentage || 0
+  const isBuilding = status?.index_status === 'building' || active
+  const isPaused = status?.index_status === 'paused'
+  const isError = status?.index_status === 'error'
+
+  return (
+    <div className="p-4 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <Database className="w-4 h-4 text-[#0972d3]" />
+          <h3 className="text-sm font-medium text-gray-900 dark:text-white">{t('data.sync.duckdbIndex')}</h3>
+        </div>
+        {status?.indexed && !isBuilding && !isPaused && (
+          <span className="text-[10px] text-green-600 dark:text-green-400 bg-green-100 dark:bg-green-900/30 px-2 py-0.5 rounded font-medium">
+            {t('data.sync.indexed')}
+          </span>
+        )}
+        {isPaused && (
+          <span className="text-[10px] text-amber-600 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/30 px-2 py-0.5 rounded font-medium">
+            {t('data.sync.paused')}
+          </span>
+        )}
+      </div>
+
+      {isBuilding && progress && (
+        <>
+          <div className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden mb-2">
+            <div
+              className="h-full bg-blue-500 rounded-full transition-all duration-500"
+              style={{ width: `${Math.max(pct, 2)}%` }}
+            />
+          </div>
+          <div className="flex items-center justify-between mb-3">
+            <span className="text-[11px] text-gray-700 dark:text-gray-300">
+              {formatBytes(progress.processed_bytes || 0)} / {formatBytes(progress.total_bytes || 0)}
+            </span>
+            <span className="text-[11px] text-gray-700 dark:text-gray-300">
+              {t('data.sync.indexProgress', { processed: progress.processed_files || 0, total: progress.total_files || 0, pct: pct.toFixed(0) })}
+            </span>
+          </div>
+          <button type="button" onClick={handleCancel}
+            aria-label={t('common.cancel')}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-red-300 dark:border-red-700 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors">
+            <Square className="w-3 h-3" /> {t('common.cancel')}
+          </button>
+        </>
+      )}
+
+      {isBuilding && !progress && (
+        <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+          <Loader2 className="w-3 h-3 animate-spin" /> {t('data.sync.indexStarting')}
+        </div>
+      )}
+
+      {!isBuilding && !isPaused && !isError && (
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] text-gray-700 dark:text-gray-300">
+            {status?.indexed
+              ? t('data.sync.indexSummary', {
+                  files: status.total_files_indexed,
+                  size: formatBytes(status.total_bytes_indexed || 0),
+                  ago: status.age_seconds && status.age_seconds < 60
+                    ? t('data.sync.indexLessThanMinute')
+                    : t('data.sync.indexMinutesAgo', { mins: Math.round((status.age_seconds || 0) / 60) }),
+                })
+              : t('data.sync.indexNotYet')}
+          </span>
+          <button type="button" onClick={handleBuild}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
+            <RotateCw className="w-3 h-3" /> {status?.indexed ? t('data.sync.indexReindex') : t('data.sync.indexBuild')}
+          </button>
+        </div>
+      )}
+
+      {isPaused && (
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] text-gray-700 dark:text-gray-300">
+            {t('data.sync.indexPausedAt', { processed: status?.total_files_indexed, total: progress?.total_files || '?' })}
+          </span>
+          <button type="button" onClick={handleBuild}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-blue-300 dark:border-blue-700 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors">
+            <Play className="w-3 h-3" /> {t('data.sync.resume')}
+          </button>
+        </div>
+      )}
+
+      {isError && (
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] text-red-600 dark:text-red-400">{t('data.sync.indexingFailed')}</span>
+          <button type="button" onClick={handleBuild}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
+            <RotateCw className="w-3 h-3" /> {t('common.retry')}
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+const ACTIVE_SESSION_STATES: ReadonlySet<string> = new Set(['downloading', 'extracting', 'verifying'])
+
+function ActiveSessionCard({ session, snapshot }: { session: Session, snapshot?: ProgressSnapshot }) {
+  const { t } = useTranslation()
+  const [cancelling, setCancelling] = useState(false)
+
+  // Clear the latched "cancelling" state once the session leaves an active state
+  // (completed/failed/interrupted) so the button doesn't stay stuck if the card
+  // is still mounted during the transition.
+  useEffect(() => {
+    if (!ACTIVE_SESSION_STATES.has(session.state)) setCancelling(false)
+  }, [session.state])
+
+  async function handleCancel() {
+    if (cancelling) return
+    setCancelling(true)
+    try {
+      const res = await fetch(endpoints.sessionCancel(session.id), { method: 'POST' })
+      // A failed cancel request should not leave the button latched forever; the
+      // user may want to retry. (A successful cancel transitions the session to a
+      // terminal state, which clears the flag via the effect above.)
+      if (!res.ok) setCancelling(false)
+    } catch {
+      // best-effort; the backend may already be tearing down. Reset so the
+      // control is usable again if the request itself failed.
+      setCancelling(false)
+    }
+  }
+
+  const pct = snapshot?.percentage || 0
+  const filesCompleted = snapshot?.files_completed || 0
+  const totalFiles = snapshot?.total_files || session.total_files || 0
+  const phase = snapshot?.phase || session.state
+  const speed = snapshot?.speed_bytes_per_sec || 0
+  const filesPerSec = snapshot?.files_per_sec || 0
+  const eta = snapshot?.eta_seconds || 0
+  const concurrency = snapshot?.concurrency || 0
+
+  const formatETA = (secs: number) => {
+    if (secs <= 0) return '--'
+    if (secs < 60) return `${secs}s`
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`
+    return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`
+  }
+
+  const hasData = totalFiles > 0
+
+  return (
+    <div className="p-4 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-900/10">
+      {/* Header row */}
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <div className="relative">
+            <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+          </div>
+          <AccountLabel accountId={session.account_id} className="text-sm font-semibold text-gray-900 dark:text-white" />
+          <span className="text-[10px] text-gray-700 dark:text-gray-300 bg-gray-200 dark:bg-gray-700 px-1.5 py-0.5 rounded">{session.log_region}</span>
+          <span className="text-[10px] font-medium text-blue-600 dark:text-blue-400 bg-blue-100 dark:bg-blue-900/40 px-1.5 py-0.5 rounded capitalize">
+            {phase}
+          </span>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="text-lg font-bold text-blue-600 dark:text-blue-400 tabular-nums">
+            {pct.toFixed(1)}%
+          </span>
+          <button
+            type="button"
+            onClick={handleCancel}
+            disabled={cancelling}
+            aria-label={t('data.sync.cancelSync')}
+            title={t('data.sync.cancelSync')}
+            className="inline-flex items-center gap-1 px-2 py-1 text-[11px] rounded border border-red-300 dark:border-red-700 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50"
+          >
+            <Square className="w-3 h-3" />
+            {cancelling ? t('data.sync.cancelling') : t('data.sync.cancel')}
+          </button>
+        </div>
+      </div>
+
+      {/* Progress bar */}
+      <div className="w-full h-2.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden mb-3">
+        <div
+          className="h-full bg-gradient-to-r from-blue-500 to-blue-400 rounded-full transition-all duration-1000 ease-out"
+          style={{ width: `${Math.max(pct, 1)}%` }}
+        />
+      </div>
+
+      {/* Stats row */}
+      {hasData ? (
+        <div className="grid grid-cols-4 gap-3">
+          <div className="flex items-center gap-1.5">
+            <HardDrive className="w-3 h-3 text-gray-400 shrink-0" />
+            <div>
+              <div className="text-[10px] text-gray-600 dark:text-gray-400">{t('data.sync.statFiles')}</div>
+              <div className="text-xs font-medium text-gray-900 dark:text-white tabular-nums">
+                {filesCompleted.toLocaleString()}/{totalFiles.toLocaleString()}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <Zap className="w-3 h-3 text-gray-400 shrink-0" />
+            <div>
+              <div className="text-[10px] text-gray-600 dark:text-gray-400">{t('data.sync.statSpeed')}</div>
+              <div className="text-xs font-medium text-gray-900 dark:text-white tabular-nums">
+                {speed > 0 ? `${formatBytes(speed)}/s` : '--'}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <Clock className="w-3 h-3 text-gray-400 shrink-0" />
+            <div>
+              <div className="text-[10px] text-gray-600 dark:text-gray-400">{t('data.sync.statETA')}</div>
+              <div className="text-xs font-medium text-gray-900 dark:text-white tabular-nums">
+                {formatETA(eta)}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <RefreshCw className="w-3 h-3 text-gray-400 shrink-0" />
+            <div>
+              <div className="text-[10px] text-gray-600 dark:text-gray-400">{t('data.sync.statWorkers')}</div>
+              <div className="text-xs font-medium text-gray-900 dark:text-white tabular-nums">
+                {concurrency > 0 ? concurrency : '--'} • {filesPerSec > 0 ? `${filesPerSec.toFixed(1)} f/s` : '--'}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2">
+          <Loader2 className="w-3 h-3 animate-spin text-gray-400" />
+          <span className="text-[11px] text-gray-700 dark:text-gray-300">{t('data.sync.listingObjects', { startDate: session.start_date, endDate: session.end_date })}</span>
+        </div>
+      )}
+
+      {/* Date range footer */}
+      {hasData && (
+        <div className="mt-2 pt-2 border-t border-blue-100 dark:border-blue-800/50 flex items-center justify-between">
+          <span className="text-[10px] text-gray-700 dark:text-gray-300">{session.start_date} → {session.end_date}</span>
+          <span className="text-[10px] text-gray-700 dark:text-gray-300">
+            {formatBytes(snapshot?.bytes_transferred || 0)} / {formatBytes(snapshot?.total_bytes || 0)}
+          </span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function StatusChip({ state }: { state: string }) {
+  const { t } = useTranslation()
+  const styles: Record<string, string> = {
+    'query-ready': 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300',
+    'failed': 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300',
+    'pending': 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
+    'interrupted': 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300',
+    'partially-verified': 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300',
+  }
+  const labelKey = `data.sync.state.${state.replace(/-/g, '_')}`
+  return (
+    <span className={`inline-block px-2 py-0.5 text-[10px] font-medium rounded ${styles[state] || styles['pending']}`}>
+      {t(labelKey, { defaultValue: state })}
+    </span>
+  )
+}
+
+// CompletedSessionRow renders one finished/failed/interrupted sync row with a
+// delete affordance. Delete confirms inline (one click → confirm state, second
+// click → DELETE). We do not auto-delete the on-disk data here because the
+// API ownership of file cleanup belongs to the backend.
+function CompletedSessionRow({ session, onDeleted }: { session: Session; onDeleted: () => void }) {
+  const { t } = useTranslation()
+  const { deleteSession, loading, error } = useDeleteSession()
+  const [confirming, setConfirming] = useState(false)
+
+  async function handleDelete() {
+    if (!confirming) {
+      setConfirming(true)
+      setTimeout(() => setConfirming(false), 4000)
+      return
+    }
+    const ok = await deleteSession(session.id)
+    if (ok) onDeleted()
+  }
+
+  return (
+    <tr className="border-b border-gray-100 dark:border-gray-800 last:border-0">
+      <td className="px-3 py-2 text-gray-900 dark:text-white"><AccountLabel accountId={session.account_id} /></td>
+      <td className="px-3 py-2 text-gray-700 dark:text-gray-300">{session.start_date} → {session.end_date}</td>
+      <td className="px-3 py-2 text-gray-700 dark:text-gray-300">{session.total_files}</td>
+      <td className="px-3 py-2 text-gray-700 dark:text-gray-300 tabular-nums">{session.disk_usage_bytes > 0 ? formatBytes(session.disk_usage_bytes) : '—'}</td>
+      <td className="px-3 py-2 text-gray-700 dark:text-gray-300">{formatRelativeTime(session.updated_at)}</td>
+      <td className="px-3 py-2">
+        <StatusChip state={session.state} />
+      </td>
+      <td className="px-3 py-2 text-right">
+        <div className="inline-flex flex-col items-end gap-1">
+          <button
+            type="button"
+            onClick={handleDelete}
+            disabled={loading}
+            aria-label={t('data.sync.deleteSession')}
+            title={confirming ? t('data.sync.confirmDelete') : t('data.sync.deleteSession')}
+            className={`inline-flex items-center gap-1 px-2 py-1 text-[10px] rounded border transition-colors ${
+              confirming
+                ? 'border-red-400 bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300 dark:border-red-700'
+                : 'border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-red-50 dark:hover:bg-red-900/20 hover:border-red-300 hover:text-red-700 dark:hover:text-red-300'
+            } disabled:opacity-50 disabled:cursor-not-allowed`}
+          >
+            <Trash2 className="w-3 h-3" />
+            {confirming ? t('data.sync.confirmDelete') : t('data.sync.deleteSession')}
+          </button>
+          {error && <span role="alert" className="max-w-48 text-[10px] text-red-700 dark:text-red-300">{error}</span>}
+        </div>
+      </td>
+    </tr>
+  )
+}

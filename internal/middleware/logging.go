@@ -1,0 +1,182 @@
+// Package middleware provides HTTP middleware for the CloudTrail Analyzer.
+// It includes structured request logging, CORS for development, and panic recovery.
+package middleware
+
+import (
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"runtime/debug"
+	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
+)
+
+// responseWriter wraps http.ResponseWriter to capture the status code.
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	written    bool
+}
+
+func newResponseWriter(w http.ResponseWriter) *responseWriter {
+	return &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	if !rw.written {
+		rw.statusCode = code
+		rw.written = true
+	}
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+	if !rw.written {
+		rw.written = true
+	}
+	return rw.ResponseWriter.Write(b)
+}
+
+// Unwrap returns the underlying ResponseWriter for middleware compatibility.
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
+// Flush implements http.Flusher by delegating to the underlying writer.
+// This is required for SSE (Server-Sent Events) endpoints to work when
+// the StructuredLogger or Recoverer middleware wraps the ResponseWriter.
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// StructuredLogger returns middleware that logs each request with slog.
+// Log fields: method, path, status_code (int), duration_ms (float64), component.
+func StructuredLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rw := newResponseWriter(w)
+
+		next.ServeHTTP(rw, r)
+
+		duration := time.Since(start)
+		slog.Info("http request",
+			"component", "cloudtrail-analyzer",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status_code", rw.statusCode,
+			"duration_ms", float64(duration.Nanoseconds())/1e6,
+		)
+	})
+}
+
+// CORS returns middleware that sets CORS headers for development mode.
+// Allows requests from localhost Vite dev server and the analyzer itself.
+func CORS(next http.Handler) http.Handler {
+	devOrigins := map[string]bool{
+		"http://localhost:5173": true,
+		"http://127.0.0.1:5173": true,
+		"http://[::1]:5173":     true,
+	}
+	allowedMethods := "GET, POST, PUT, DELETE, OPTIONS"
+	allowedHeaders := "Content-Type, Authorization"
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+
+		if origin != "" && !corsOriginAllowed(origin, r.Host, devOrigins) {
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+			return
+		}
+		if isMutation(r.Method) && r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			http.Error(w, "cross-site request not allowed", http.StatusForbidden)
+			return
+		}
+
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", allowedMethods)
+			w.Header().Set("Access-Control-Allow-Headers", allowedHeaders)
+			w.Header().Add("Vary", "Origin")
+		}
+
+		// Handle preflight requests
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func corsOriginAllowed(origin, requestHost string, devOrigins map[string]bool) bool {
+	if devOrigins[origin] {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	return parsed.Host == requestHost
+}
+
+func isMutation(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+
+// SecurityHeaders returns middleware that sets defensive HTTP response headers.
+// nosniff blocks MIME-type confusion attacks; DENY blocks clickjacking via iframes;
+// no-referrer keeps localhost paths out of any external referer headers if a link
+// is ever shared. CSP is intentionally omitted — the React bundle uses inline
+// styles and dynamic Vite assets, and a strict CSP would need careful tuning.
+func SecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Recoverer returns middleware that catches panics, logs the stack trace via slog,
+// and returns a 500 JSON error response. It wraps Chi's middleware.Recoverer pattern
+// with structured logging.
+func Recoverer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				// Use Chi's middleware package to get the request ID if available
+				reqID := middleware.GetReqID(r.Context())
+
+				stack := debug.Stack()
+				slog.Error("panic recovered",
+					"component", "cloudtrail-analyzer",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"panic", rec,
+					"stack", string(stack),
+					"request_id", reqID,
+				)
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{
+					"code":    "INTERNAL_ERROR",
+					"message": "An internal error occurred",
+				})
+			}
+		}()
+
+		next.ServeHTTP(w, r)
+	})
+}

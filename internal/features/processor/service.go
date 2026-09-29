@@ -1,0 +1,712 @@
+package processor
+
+import (
+	"context"
+	"crypto/tls"
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"cloudtrail-analyzer/internal/awsutil"
+	"cloudtrail-analyzer/internal/config"
+	"cloudtrail-analyzer/internal/features/sessions"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+)
+
+// Service orchestrates the S3 download pipeline for sessions.
+type Service struct {
+	db  *sql.DB
+	cfg *config.Config
+
+	// Track active processing pipelines per session
+	mu       sync.Mutex
+	active   map[string]*activePipeline
+	progress map[string]chan ProcessingProgress
+
+	// Live snapshot of latest progress per session (for REST polling)
+	snapMu    sync.RWMutex
+	snapshots map[string]*ProgressSnapshot
+
+	// OnFileExtracted is called each time a file is successfully extracted.
+	OnFileExtracted func(context.Context, string, int64)
+
+	// OnSyncComplete is called after a session reaches query_ready or partially_verified state.
+	OnSyncComplete func(context.Context)
+}
+
+type activePipeline struct {
+	cancelled bool
+	cancel    context.CancelFunc
+	done      chan struct{}
+}
+
+// ProgressSnapshot holds the latest progress state for REST polling.
+type ProgressSnapshot struct {
+	ProcessingProgress
+	StartedAt     time.Time `json:"started_at"`
+	LastUpdatedAt time.Time `json:"last_updated_at"`
+	Speed         float64   `json:"speed_bytes_per_sec"`
+	FilesPerSec   float64   `json:"files_per_sec"`
+	ETASeconds    int       `json:"eta_seconds"`
+	Concurrency   int       `json:"concurrency"`
+}
+
+// NewService creates a new processor Service.
+func NewService(db *sql.DB, cfg *config.Config) *Service {
+	return &Service{
+		db:        db,
+		cfg:       cfg,
+		active:    make(map[string]*activePipeline),
+		progress:  make(map[string]chan ProcessingProgress),
+		snapshots: make(map[string]*ProgressSnapshot),
+	}
+}
+
+// GetProgressSnapshot returns the latest progress snapshot for a session.
+func (s *Service) GetProgressSnapshot(sessionID string) (*ProgressSnapshot, bool) {
+	s.snapMu.RLock()
+	defer s.snapMu.RUnlock()
+	snap, ok := s.snapshots[sessionID]
+	if !ok {
+		return nil, false
+	}
+	snapshot := *snap
+	return &snapshot, true
+}
+
+// updateSnapshot updates the in-memory progress snapshot for REST polling.
+func (s *Service) updateSnapshot(sessionID string, p ProcessingProgress) {
+	s.snapMu.Lock()
+	defer s.snapMu.Unlock()
+
+	now := time.Now()
+	snap, exists := s.snapshots[sessionID]
+	if !exists {
+		snap = &ProgressSnapshot{
+			StartedAt:   now,
+			Concurrency: s.cfg.MaxDownloadConcurrency,
+		}
+		s.snapshots[sessionID] = snap
+	}
+
+	elapsed := now.Sub(snap.StartedAt).Seconds()
+	if elapsed > 0 && p.BytesTransferred > 0 {
+		snap.Speed = float64(p.BytesTransferred) / elapsed
+		snap.FilesPerSec = float64(p.FilesCompleted) / elapsed
+
+		if snap.Speed > 0 && p.TotalBytes > p.BytesTransferred {
+			remaining := float64(p.TotalBytes - p.BytesTransferred)
+			snap.ETASeconds = int(remaining / snap.Speed)
+		}
+	}
+
+	snap.ProcessingProgress = p
+	snap.LastUpdatedAt = now
+	snap.Concurrency = s.cfg.MaxDownloadConcurrency
+}
+
+// clearSnapshot removes the progress snapshot when a session completes.
+func (s *Service) clearSnapshot(sessionID string) {
+	s.snapMu.Lock()
+	defer s.snapMu.Unlock()
+	delete(s.snapshots, sessionID)
+}
+
+// StartProcessing begins the download pipeline for a session.
+// It validates the session state, then runs a pipelined: list → estimate → (download + extract concurrently) → verify.
+// Download and extraction happen in parallel — files are extracted as soon as they're downloaded.
+func (s *Service) StartProcessing(ctx context.Context, sessionID string, progressCh chan ProcessingProgress) error {
+	return s.startProcessing(ctx, sessionID, progressCh, nil)
+}
+
+// StartProcessingAsync claims and registers the pipeline before returning. The
+// caller receives an error synchronously if another start or deletion won.
+func (s *Service) StartProcessingAsync(ctx context.Context, sessionID string, progressCh chan ProcessingProgress) error {
+	ready := make(chan error, 1)
+	go func() {
+		defer close(progressCh)
+		if err := s.startProcessing(ctx, sessionID, progressCh, ready); err != nil {
+			slog.Error("processing pipeline failed",
+				"component", "cloudtrail-analyzer",
+				"session_id", sessionID,
+				"error", err.Error(),
+			)
+		}
+	}()
+	return <-ready
+}
+
+func (s *Service) startProcessing(
+	ctx context.Context,
+	sessionID string,
+	progressCh chan ProcessingProgress,
+	ready chan error,
+) (retErr error) {
+	signalReady := func(err error) {
+		if ready == nil {
+			return
+		}
+		ready <- err
+		close(ready)
+		ready = nil
+	}
+	defer func() {
+		if ready != nil {
+			signalReady(retErr)
+		}
+	}()
+
+	// Register this pipeline as active
+	s.mu.Lock()
+	if _, exists := s.active[sessionID]; exists {
+		s.mu.Unlock()
+		return fmt.Errorf("session %s already has an active pipeline", sessionID)
+	}
+	pipelineCtx, cancel := context.WithCancel(ctx)
+	pipeline := &activePipeline{cancel: cancel, done: make(chan struct{})}
+	s.active[sessionID] = pipeline
+	s.progress[sessionID] = progressCh
+	s.mu.Unlock()
+
+	// Ensure cleanup on exit
+	defer func() {
+		if pipelineCtx.Err() != nil {
+			if err := sessions.MarkInterruptedIfActive(s.db, sessionID); err != nil {
+				slog.Warn("failed to mark cancelled session interrupted",
+					"component", "cloudtrail-analyzer",
+					"session_id", sessionID,
+					"error", err.Error(),
+				)
+			}
+		}
+		s.mu.Lock()
+		delete(s.active, sessionID)
+		delete(s.progress, sessionID)
+		s.mu.Unlock()
+		cancel()
+		close(pipeline.done)
+	}()
+
+	session, err := sessions.ClaimForProcessing(s.db, sessionID)
+	if err != nil {
+		return fmt.Errorf("claiming session for processing: %w", err)
+	}
+	signalReady(nil)
+
+	// Load AWS config with optimized HTTP transport
+	awsCfg, err := s.loadAWSConfig(pipelineCtx, session.Region)
+	if err != nil {
+		s.terminate(pipelineCtx, sessionID, "downloading", progressCh, "Failed to load AWS configuration")
+		return fmt.Errorf("loading AWS config: %w", err)
+	}
+
+	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.HTTPClient = s.optimizedHTTPClient()
+	})
+
+	// Phase 1: List objects
+	s.sendProgress(progressCh, ProcessingProgress{
+		SessionID: sessionID,
+		Phase:     "listing",
+		Message:   "Listing S3 objects...",
+	})
+
+	objects, totalSize, err := listObjects(pipelineCtx, client, session)
+	if err != nil {
+		s.terminate(pipelineCtx, sessionID, "listing", progressCh, "Failed to list S3 objects")
+		return fmt.Errorf("listing objects: %w", err)
+	}
+
+	if len(objects) == 0 {
+		s.failSession(sessionID, progressCh, "No .json.gz files found for this session")
+		return fmt.Errorf("no objects found for session %s", sessionID)
+	}
+
+	slog.Info("listed S3 objects",
+		"component", "cloudtrail-analyzer",
+		"session_id", sessionID,
+		"object_count", len(objects),
+		"total_size_bytes", totalSize,
+	)
+
+	// Phase 2: Estimate disk and check availability
+	estimate := s.estimateDisk(totalSize)
+	if !estimate.Sufficient {
+		s.failSession(sessionID, progressCh, fmt.Sprintf(
+			"Insufficient disk space: need %d bytes, have %d bytes",
+			estimate.RequiredBytes, estimate.AvailableBytes))
+		return fmt.Errorf("insufficient disk space: need %d, have %d",
+			estimate.RequiredBytes, estimate.AvailableBytes)
+	}
+
+	s.sendProgress(progressCh, ProcessingProgress{
+		SessionID:  sessionID,
+		Phase:      "listing",
+		TotalFiles: len(objects),
+		TotalBytes: totalSize,
+		Message:    fmt.Sprintf("Found %d files (%d MB). Disk check passed.", len(objects), totalSize/(1024*1024)),
+	})
+
+	// Phase 3: Pipelined download + extract
+	// Downloads and extraction run concurrently — each file is extracted immediately after download.
+	concurrency := s.cfg.MaxDownloadConcurrency
+	if concurrency < 1 {
+		concurrency = 16
+	}
+
+	dataDir := s.cfg.DataDir
+	extractionFailures, err := s.downloadAndExtract(pipelineCtx, client, session, objects, dataDir, concurrency, totalSize, progressCh)
+	if err != nil {
+		s.terminate(pipelineCtx, sessionID, "downloading", progressCh, downloadFailureMessage(err))
+		if pipelineCtx.Err() != nil {
+			return fmt.Errorf("processing cancelled: %w", err)
+		}
+		return fmt.Errorf("download and extract: %w", err)
+	}
+
+	// Phase 4: Verify files
+	if err := sessions.UpdateState(s.db, sessionID, sessions.StateVerifying); err != nil {
+		return fmt.Errorf("updating session state to verifying: %w", err)
+	}
+
+	totalVerified, diskBytes, failedFiles, err := verifyFiles(pipelineCtx, session, dataDir, progressCh)
+	if err != nil {
+		s.terminate(pipelineCtx, sessionID, "verifying", progressCh, "Verification failed")
+		return fmt.Errorf("verifying files: %w", err)
+	}
+	failedFiles = mergeFailedFiles(extractionFailures, failedFiles)
+
+	if pipelineCtx.Err() != nil {
+		s.terminate(pipelineCtx, sessionID, "verifying", progressCh, "Processing cancelled")
+		return fmt.Errorf("processing cancelled: %w", pipelineCtx.Err())
+	}
+
+	// Determine final state
+	finalState := sessions.StateQueryReady
+	if len(failedFiles) > 0 {
+		finalState = sessions.StatePartiallyVerified
+	}
+
+	s.mu.Lock()
+	if pipeline.cancelled {
+		s.mu.Unlock()
+		return fmt.Errorf("processing cancelled: %w", context.Canceled)
+	}
+	err = sessions.CompleteProcessing(
+		s.db, sessionID, len(objects), diskBytes, failedFiles, finalState,
+	)
+	s.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("committing session results: %w", err)
+	}
+
+	s.sendProgress(progressCh, ProcessingProgress{
+		SessionID:      sessionID,
+		Phase:          "verifying",
+		FilesCompleted: len(objects),
+		TotalFiles:     len(objects),
+		Percentage:     100,
+		Message:        fmt.Sprintf("Complete. %d files verified, %d failed.", totalVerified, len(failedFiles)),
+	})
+
+	slog.Info("processing complete",
+		"component", "cloudtrail-analyzer",
+		"session_id", sessionID,
+		"total_files", totalVerified,
+		"failed_files", len(failedFiles),
+		"final_state", string(finalState),
+	)
+
+	s.clearSnapshot(sessionID)
+
+	if s.OnSyncComplete != nil {
+		s.OnSyncComplete(pipelineCtx)
+	}
+
+	return nil
+}
+
+// downloadAndExtract runs a pipelined download + extraction. Workers download files from S3
+// and immediately extract each .json.gz to .json in the same goroutine, eliminating the idle
+// time between the download and extraction phases.
+func (s *Service) downloadAndExtract(ctx context.Context, client *s3.Client, session *sessions.Session, objects []S3Object, dataDir string, concurrency int, totalBytes int64, progressCh chan<- ProcessingProgress) ([]string, error) {
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	workCh := make(chan S3Object, concurrency*2)
+	var wg sync.WaitGroup
+
+	var filesCompleted atomic.Int64
+	var bytesTransferred atomic.Int64
+	totalFiles := len(objects)
+
+	var downloadErr error
+	var errOnce sync.Once
+	var failedMu sync.Mutex
+	var extractionFailures []string
+
+	// Start workers — each worker downloads AND extracts
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for obj := range workCh {
+				if workCtx.Err() != nil {
+					return
+				}
+
+				localPath := constructLocalPath(dataDir, session.Bucket, obj.Key)
+				jsonPath := localPath[:len(localPath)-3] // strip .gz
+
+				// Skip if already fully processed (extracted json exists)
+				if info, err := os.Stat(jsonPath); err == nil && info.Size() > 0 {
+					completed := filesCompleted.Add(1)
+					bytesTransferred.Add(obj.Size)
+					s.sendPipelineProgress(progressCh, session.ID, int(completed), totalFiles, bytesTransferred.Load(), totalBytes)
+					continue
+				}
+
+				// Skip download if .gz already exists with matching size
+				needsDownload := true
+				if info, err := os.Stat(localPath); err == nil && info.Size() == obj.Size {
+					needsDownload = false
+				}
+
+				if needsDownload {
+					if err := downloadSingleFile(workCtx, client, session.Bucket, obj.Key, localPath); err != nil {
+						slog.Error("failed to download file",
+							"component", "cloudtrail-analyzer",
+							"session_id", session.ID,
+							"key", obj.Key,
+							"error", err.Error(),
+						)
+						errOnce.Do(func() {
+							downloadErr = fmt.Errorf("downloading %s: %w", obj.Key, err)
+							cancel()
+						})
+						return
+					}
+				}
+
+				// Extract immediately after download
+				if _, err := extractSingleFileWithLimit(localPath, jsonPath, maxPerFileBytes); err != nil {
+					slog.Warn("failed to extract file",
+						"component", "cloudtrail-analyzer",
+						"session_id", session.ID,
+						"file", localPath,
+						"error", err.Error(),
+					)
+					failedPath, relErr := filepath.Rel(dataDir, localPath)
+					if relErr != nil {
+						failedPath = obj.Key
+					}
+					failedMu.Lock()
+					extractionFailures = append(extractionFailures, failedPath)
+					failedMu.Unlock()
+				} else if s.OnFileExtracted != nil {
+					info, _ := os.Stat(jsonPath)
+					if info != nil {
+						s.OnFileExtracted(workCtx, jsonPath, info.Size())
+					}
+				}
+
+				completed := filesCompleted.Add(1)
+				bytesTransferred.Add(obj.Size)
+				s.sendPipelineProgress(progressCh, session.ID, int(completed), totalFiles, bytesTransferred.Load(), totalBytes)
+			}
+		}()
+	}
+
+	// Feed work
+feed:
+	for _, obj := range objects {
+		select {
+		case workCh <- obj:
+		case <-workCtx.Done():
+			break feed
+		}
+	}
+	close(workCh)
+
+	wg.Wait()
+	if downloadErr == nil && ctx.Err() != nil {
+		downloadErr = ctx.Err()
+	}
+	return extractionFailures, downloadErr
+}
+
+func downloadFailureMessage(err error) string {
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "kms:decrypt"),
+		strings.Contains(message, "kms accessdenied"),
+		strings.Contains(message, "kms access denied"):
+		return "Download failed: credentials need kms:Decrypt access to the S3 bucket key"
+	case strings.Contains(message, "accessdenied"),
+		strings.Contains(message, "access denied"),
+		strings.Contains(message, "s3:getobject"):
+		return "Download failed: credentials need s3:GetObject access to the selected logs"
+	default:
+		return "Download/extraction failed; check S3 access and the server log"
+	}
+}
+
+func mergeFailedFiles(groups ...[]string) []string {
+	seen := make(map[string]struct{})
+	var merged []string
+	for _, group := range groups {
+		for _, path := range group {
+			if path == "" {
+				continue
+			}
+			if _, exists := seen[path]; exists {
+				continue
+			}
+			seen[path] = struct{}{}
+			merged = append(merged, path)
+		}
+	}
+	return merged
+}
+
+// sendPipelineProgress sends a combined download+extract progress event and updates the snapshot.
+func (s *Service) sendPipelineProgress(ch chan<- ProcessingProgress, sessionID string, completed, total int, bytesTransferred, totalBytes int64) {
+	var pct float64
+	if totalBytes > 0 {
+		pct = float64(bytesTransferred) / float64(totalBytes) * 100
+	}
+
+	p := ProcessingProgress{
+		SessionID:        sessionID,
+		Phase:            "downloading",
+		FilesCompleted:   completed,
+		TotalFiles:       total,
+		BytesTransferred: bytesTransferred,
+		TotalBytes:       totalBytes,
+		Percentage:       pct,
+		Message:          fmt.Sprintf("Processed %d/%d files (download + extract)", completed, total),
+	}
+
+	// Always update the snapshot for REST polling
+	s.updateSnapshot(sessionID, p)
+
+	select {
+	case ch <- p:
+	default:
+	}
+}
+
+// optimizedHTTPClient returns an HTTP client tuned for high-throughput S3 downloads.
+// High connection pool limits allow many parallel requests to the same S3 endpoint,
+// critical for PrivateLink and VPC endpoint scenarios where latency is minimal.
+func (s *Service) optimizedHTTPClient() *http.Client {
+	concurrency := s.cfg.MaxDownloadConcurrency
+	if concurrency < 16 {
+		concurrency = 16
+	}
+	poolSize := concurrency * 4
+
+	transport := &http.Transport{
+		MaxIdleConns:        poolSize,
+		MaxIdleConnsPerHost: poolSize,
+		MaxConnsPerHost:     poolSize,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: 30 * time.Second,
+		DisableCompression:    true, // S3 objects are already gzipped
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   0, // No overall timeout — context handles cancellation
+	}
+}
+
+// CancelProcessing cancels the active pipeline and waits until all of its
+// workers have stopped writing.
+func (s *Service) CancelProcessing(ctx context.Context, sessionID string) error {
+	s.mu.Lock()
+	pipeline, exists := s.active[sessionID]
+	if !exists {
+		s.mu.Unlock()
+		return fmt.Errorf("no active pipeline for session %s", sessionID)
+	}
+	pipeline.cancelled = true
+	pipeline.cancel()
+	s.mu.Unlock()
+	select {
+	case <-pipeline.done:
+		s.clearSnapshot(sessionID)
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for session %s to stop: %w", sessionID, ctx.Err())
+	}
+}
+
+// Shutdown cancels every active pipeline and waits for its workers to exit.
+// It is called from main on SIGINT/SIGTERM, before server.Shutdown, so that
+// detached download/extract goroutines stop writing mid-batch and any in-flight
+// SSE handler observes the cancellation instead of blocking on the progress
+// channel until the shutdown timeout elapses. Cancelling each pipeline context
+// lets the StartProcessing goroutine return and close its progress channel,
+// which unblocks the SSE reader.
+func (s *Service) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	pipelines := make(map[string]*activePipeline, len(s.active))
+	for id, pipeline := range s.active {
+		pipelines[id] = pipeline
+		pipeline.cancelled = true
+		pipeline.cancel()
+	}
+	s.mu.Unlock()
+
+	if len(pipelines) == 0 {
+		return nil
+	}
+
+	slog.Info("cancelling active sync pipelines for shutdown",
+		"component", "cloudtrail-analyzer",
+		"active_pipelines", len(pipelines),
+	)
+	for id, pipeline := range pipelines {
+		select {
+		case <-pipeline.done:
+			s.clearSnapshot(id)
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for active sync pipelines: %w", ctx.Err())
+		}
+	}
+	return nil
+}
+
+// GetProgressChannel returns the progress channel for a session, if active.
+func (s *Service) GetProgressChannel(sessionID string) (chan ProcessingProgress, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch, exists := s.progress[sessionID]
+	return ch, exists
+}
+
+// estimateDisk calculates disk space requirements (2.5x S3 size for compressed + extracted).
+func (s *Service) estimateDisk(totalS3Size int64) DiskEstimate {
+	required := int64(float64(totalS3Size) * 2.5)
+	available := s.getAvailableDiskSpace()
+
+	return DiskEstimate{
+		S3SizeBytes:    totalS3Size,
+		RequiredBytes:  required,
+		AvailableBytes: available,
+		Sufficient:     available >= required,
+	}
+}
+
+// getAvailableDiskSpace returns available bytes on the data directory filesystem.
+func (s *Service) getAvailableDiskSpace() int64 {
+	var stat syscall.Statfs_t
+	path := s.cfg.DataDir
+	if path == "" {
+		path = "."
+	}
+
+	if err := syscall.Statfs(path, &stat); err != nil {
+		slog.Warn("failed to check disk space",
+			"component", "cloudtrail-analyzer",
+			"path", path,
+			"error", err.Error(),
+		)
+		// Return a large value so we don't block on disk check failure
+		return int64(100 * 1024 * 1024 * 1024) // 100 GB fallback
+	}
+
+	return int64(stat.Bavail) * int64(stat.Bsize)
+}
+
+// failSession updates the session state to failed and sends a progress event.
+func (s *Service) failSession(sessionID string, progressCh chan<- ProcessingProgress, message string) {
+	_ = sessions.UpdateState(s.db, sessionID, sessions.StateFailed)
+	s.sendProgress(progressCh, ProcessingProgress{
+		SessionID: sessionID,
+		Phase:     "failed",
+		Message:   message,
+	})
+}
+
+// terminate routes a phase error to either interrupted or failed based on
+// whether the context was cancelled. Cancellation is a user action, not a
+// fault — the UI shows it differently from a true failure.
+func (s *Service) terminate(ctx context.Context, sessionID string, phase string, progressCh chan<- ProcessingProgress, failMessage string) {
+	if ctx.Err() != nil {
+		_ = sessions.UpdateState(s.db, sessionID, sessions.StateInterrupted)
+		s.sendProgress(progressCh, ProcessingProgress{
+			SessionID: sessionID,
+			Phase:     phase,
+			Message:   "Processing cancelled",
+		})
+		return
+	}
+	s.failSession(sessionID, progressCh, failMessage)
+}
+
+// sendProgress sends a progress event to the channel without blocking.
+func (s *Service) sendProgress(ch chan<- ProcessingProgress, progress ProcessingProgress) {
+	s.updateSnapshot(progress.SessionID, progress)
+	select {
+	case ch <- progress:
+	default:
+	}
+}
+
+// loadAWSConfig builds an AWS config using the configured auth method.
+func (s *Service) loadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
+	switch s.cfg.Auth.Method {
+	case "session_credentials":
+		return awsconfig.LoadDefaultConfig(ctx,
+			awsconfig.WithRegion(region),
+			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+				os.Getenv("AWS_ACCESS_KEY_ID"),
+				os.Getenv("AWS_SECRET_ACCESS_KEY"),
+				os.Getenv("AWS_SESSION_TOKEN"),
+			)),
+		)
+	case "imds":
+		return awsconfig.LoadDefaultConfig(ctx,
+			awsconfig.WithRegion(region),
+			awsconfig.WithCredentialsProvider(awsutil.NewIMDSv2Provider()),
+		)
+	case "sso":
+		opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
+		if s.cfg.Auth.SSOProfile != "" {
+			opts = append(opts, awsconfig.WithSharedConfigProfile(s.cfg.Auth.SSOProfile))
+		}
+		return awsconfig.LoadDefaultConfig(ctx, opts...)
+	case "static":
+		return awsconfig.LoadDefaultConfig(ctx,
+			awsconfig.WithRegion(region),
+			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+				s.cfg.Auth.AccessKeyID,
+				s.cfg.Auth.SecretAccessKey,
+				"",
+			)),
+		)
+	default:
+		return awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	}
+}
